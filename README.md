@@ -118,9 +118,21 @@ hipcc --offload-arch=gfx906 -c validate_hip.cpp -o /tmp/v.o && echo OK
 
 ## Key decisions
 
-### ROCm: nixpkgs, not source build
+### ROCm: nixpkgs derivations with scope override, not manual source build
 
-Building ROCm from source was the fallback plan if nixpkgs lacked gfx906 kernel objects. The audit confirmed they're present, so nixpkgs ROCm is used directly. Source build would have added days of work for no benefit.
+The flake uses `overrideScope` on `rocmPackages` to replace `clr` (gfx906-only
+GPU targets) and `rocmClangStdenv` (test/benchmark flags stripped). Because
+all math libs (`rocblas`, `hipblas`, `rocrand`, `rocfft`, `hipsparse`) use
+`rocmClangStdenv` to compile, they were all rebuilt from source with the new
+stdenv — their nixpkgs binary cache paths no longer matched.
+
+The win over a manual ROCm source build: Nix handled the derivations,
+dependency wiring, and source fetches. The override just changed two nodes in
+the graph and let Nix propagate the consequences. No custom cmake superbuild,
+no manually written derivations, no source checkouts to manage.
+
+The one-time rebuild cost was the price of having a coherent, gfx906-only
+ROCm stack rather than a multi-arch default build.
 
 ### PyTorch: 2.9.x with `USE_FLASH_ATTN=0`
 
@@ -170,6 +182,29 @@ If the system is wiped and needs to be reconstructed:
 5. Copy the new wheel to `wheels/`, run `uv pip install -r requirements.txt`
 
 Total time: however long the PyTorch compile takes (~4–8h without ccache warmup, much less with).
+
+### On the ROCm math stack rebuild: it will crash, keep going
+
+The LLVM frontend used by the ROCm build is flaky under sustained parallel
+load. During the initial build of this environment, the compile crashed
+approximately two dozen times before completing. This is normal.
+
+**The pattern to distinguish "flaky crash" from "real error":**
+- Flaky: crash point moves around between runs, or the same point crashes
+  once then succeeds next time
+- Real error: you get the exact same error at the exact same point two or
+  three runs in a row
+
+If it's flaky, just run `nix develop` again. Nix's incremental build picks up
+where it left off — you're not recompiling from zero each time. Eventually it
+gets through.
+
+The flags that got it over the line:
+- `-DBUILD_CLIENTS_TESTS=OFF` / `-DBUILD_CLIENTS_BENCHMARKS=OFF` / `-DBUILD_CLIENTS=OFF`
+  — removes a large chunk of compilation that isn't needed at runtime
+- `-DTENSILE_COMPILER_FLAGS=-O2` instead of the default `-O3`
+  — reduces peak memory and compiler stress during Tensile kernel compilation,
+  which is where most of the crashes were happening
 
 ---
 
